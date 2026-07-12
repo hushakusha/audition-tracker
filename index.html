@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Call Board — Audition Tracker</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="cb-root">
+  <div class="cb-header">
+    <div>
+      <div class="cb-title">CALL BOARD</div>
+      <div class="cb-sub">Audition Tracker</div>
+    </div>
+    <div class="cb-header-actions">
+      <button class="cb-icon-btn" onclick="cbOpenSettings()">GitHub Settings</button>
+      <button class="cb-icon-btn" onclick="cbExportCsv()">Export CSV</button>
+      <button class="cb-add-btn" onclick="cbOpenModal()">+ New Audition</button>
+    </div>
+  </div>
+
+  <div class="cb-status-line" id="cb-status"></div>
+
+  <div id="cb-connect-screen"></div>
+
+  <div id="cb-app-screen" style="display:none;">
+    <div class="cb-stats" id="cb-stats"></div>
+    <div class="cb-tabs" id="cb-type-tabs"></div>
+    <div class="cb-tabs" id="cb-status-tabs"></div>
+    <div class="cb-grid" id="cb-grid"></div>
+  </div>
+</div>
+
+<div id="cb-modal-container"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
