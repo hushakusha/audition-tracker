@@ -80,9 +80,52 @@ async function ghPut(settings, contentObj, sha){
   return res;
 }
 
+/* ---------- One-time setup link (avoids retyping the token on each device) ---------- */
+
+function tryConnectFromUrl(){
+  const params = new URLSearchParams(window.location.search);
+  if (!params.has('gh_token')) return false;
+  const settings = {
+    owner: params.get('gh_owner') || '',
+    repo: params.get('gh_repo') || '',
+    branch: params.get('gh_branch') || 'main',
+    filepath: params.get('gh_filepath') || 'data/auditions.json',
+    token: params.get('gh_token') || ''
+  };
+  if (!settings.owner || !settings.repo || !settings.token) return false;
+  saveSettings(settings);
+  // Strip the token out of the URL bar/history immediately so it isn't left visible or bookmarked with the token in it
+  const cleanUrl = window.location.origin + window.location.pathname;
+  window.history.replaceState({}, document.title, cleanUrl);
+  return true;
+}
+
+function buildSetupLink(){
+  const s = getSettings();
+  if (!s) return '';
+  const base = window.location.origin + window.location.pathname;
+  const params = new URLSearchParams({
+    gh_owner: s.owner, gh_repo: s.repo, gh_branch: s.branch,
+    gh_filepath: s.filepath, gh_token: s.token
+  });
+  return `${base}?${params.toString()}`;
+}
+
+window.cbCopySetupLink = async function(){
+  const link = buildSetupLink();
+  if (!link){ showStatus('Connect first, then a setup link will be available.', 'err'); return; }
+  try {
+    await navigator.clipboard.writeText(link);
+    showStatus('Setup link copied — open it once on your other device to auto-connect.', 'ok');
+  } catch(e){
+    prompt('Copy this setup link:', link);
+  }
+};
+
 /* ---------- Load / Save ---------- */
 
 async function loadAll(){
+  tryConnectFromUrl();
   const settings = getSettings();
   if (!settings){
     showConnectScreen();
@@ -175,7 +218,9 @@ function showConnectScreen(){
         <label>Personal access token</label>
         <input id="s-token" type="password" value="${s.token || ''}" placeholder="github_pat_...">
       </div>
+      ${s.owner ? `<p style="margin-top:-4px;">Already connected here. To set up another device without retyping the token, copy a one-time link below and open it once on that device.</p>` : ''}
       <div class="cb-modal-actions">
+        ${s.owner ? `<button class="cb-btn-secondary" onclick="cbCopySetupLink()">Copy Setup Link</button>` : ''}
         ${s.owner ? `<button class="cb-btn-danger" onclick="cbDisconnect()">Disconnect</button>` : ''}
         <button class="cb-btn-primary" onclick="cbConnect()">${s.owner ? 'Save & Reconnect' : 'Connect'}</button>
       </div>
