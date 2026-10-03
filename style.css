@@ -169,7 +169,6 @@ html, body {
 
 /* Week view */
 .cb-week-view { display: flex; flex-direction: column; gap: 22px; }
-.cb-week-group { }
 .cb-week-header {
   font-family: 'Bebas Neue', sans-serif;
   font-size: 17px;
