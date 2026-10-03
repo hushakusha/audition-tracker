@@ -1,32 +1,28 @@
 /* Call Board — Audition Tracker
-   Storage layer: GitHub Contents API (a JSON file in your own repo acts as the database) */
+   Multi-user version: Supabase handles auth (signup/login) and data storage,
+   with row-level security so each person only ever sees their own auditions. */
+
+// ⚠️ Replace these two with your own project's values:
+// Supabase dashboard → Settings → API → Project URL / anon public key.
+// The anon key is meant to be public — it's safe to commit; real protection
+// comes from the row-level security policies in supabase-setup.sql.
+const SUPABASE_URL = "https://iqyllshomldskiixlqla.supabase.co/rest/v1/";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImlxeWxsc2hvbWxkc2tpaXhscWxhIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTEwNDkwOTgsImV4cCI6MjEwNjYyNTA5OH0.7obhJn3f3QNwsm0sFRrENbmW3HvcOxM_fEurkArwyjc";
+
+const supabase = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 const TYPES = ["Film","TV","Commercial","Theatre","Voiceover","Print","Other"];
 const STATUSES = ["Submitted","Callback","Booked","Passed"];
-const SETTINGS_KEY = 'cb-gh-settings';
+const STATUS_ORDER = { Callback: 0, Submitted: 1, Booked: 2, Passed: 3 };
 
 let auditions = [];
-let currentSha = null;
 let editingId = null;
 let filterType = "All";
 let filterStatus = "All";
-
-/* ---------- Settings (stored only in this browser's localStorage, never committed) ---------- */
-
-function getSettings(){
-  try {
-    const raw = localStorage.getItem(SETTINGS_KEY);
-    return raw ? JSON.parse(raw) : null;
-  } catch(e) { return null; }
-}
-
-function saveSettings(s){
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(s));
-}
-
-function clearSettings(){
-  localStorage.removeItem(SETTINGS_KEY);
-}
+let viewMode = "board";
+let sortBy = "date-asc";
+let authMode = "login"; // "login" | "signup"
+let currentUser = null;
 
 /* ---------- Status line ---------- */
 
@@ -36,230 +32,156 @@ function showStatus(msg, kind){
   el.className = 'cb-status-line' + (kind ? ' ' + kind : '');
 }
 
-/* ---------- GitHub Contents API ---------- */
+/* ---------- Row <-> app object mapping ---------- */
 
-function b64EncodeUnicode(str){
-  return btoa(encodeURIComponent(str).replace(/%([0-9A-F]{2})/g,
-    (_, p1) => String.fromCharCode('0x' + p1)));
-}
-function b64DecodeUnicode(str){
-  return decodeURIComponent(atob(str).split('').map(c =>
-    '%' + ('00' + c.charCodeAt(0).toString(16)).slice(-2)).join(''));
-}
-
-function apiUrl(settings){
-  return `https://api.github.com/repos/${settings.owner}/${settings.repo}/contents/${settings.filepath}`;
-}
-
-async function ghGet(settings){
-  const res = await fetch(`${apiUrl(settings)}?ref=${encodeURIComponent(settings.branch)}`, {
-    headers: {
-      'Authorization': `Bearer ${settings.token}`,
-      'Accept': 'application/vnd.github+json'
-    }
-  });
-  return res;
-}
-
-async function ghPut(settings, contentObj, sha){
-  const body = {
-    message: `Update auditions — ${new Date().toISOString()}`,
-    content: b64EncodeUnicode(JSON.stringify(contentObj, null, 2)),
-    branch: settings.branch
+function fromRow(row){
+  return {
+    id: row.id,
+    project: row.project,
+    role: row.role || '',
+    date: row.date || '',
+    time: row.time || '',
+    type: row.type || 'Other',
+    status: row.status || 'Submitted',
+    format: row.format || '',
+    castingDirector: row.casting_director || '',
+    notes: row.notes || '',
+    createdAt: row.created_at
   };
-  if (sha) body.sha = sha;
-  const res = await fetch(apiUrl(settings), {
-    method: 'PUT',
-    headers: {
-      'Authorization': `Bearer ${settings.token}`,
-      'Accept': 'application/vnd.github+json',
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(body)
-  });
-  return res;
 }
 
-/* ---------- One-time setup link (avoids retyping the token on each device) ---------- */
-
-function tryConnectFromUrl(){
-  const params = new URLSearchParams(window.location.search);
-  if (!params.has('gh_token')) return false;
-  const settings = {
-    owner: params.get('gh_owner') || '',
-    repo: params.get('gh_repo') || '',
-    branch: params.get('gh_branch') || 'main',
-    filepath: params.get('gh_filepath') || 'data/auditions.json',
-    token: params.get('gh_token') || ''
+function toRow(a){
+  return {
+    project: a.project,
+    role: a.role,
+    date: a.date || null,
+    time: a.time,
+    type: a.type,
+    status: a.status,
+    format: a.format,
+    casting_director: a.castingDirector,
+    notes: a.notes,
+    user_id: currentUser.id
   };
-  if (!settings.owner || !settings.repo || !settings.token) return false;
-  saveSettings(settings);
-  // Strip the token out of the URL bar/history immediately so it isn't left visible or bookmarked with the token in it
-  const cleanUrl = window.location.origin + window.location.pathname;
-  window.history.replaceState({}, document.title, cleanUrl);
-  return true;
 }
 
-function buildSetupLink(){
-  const s = getSettings();
-  if (!s) return '';
-  const base = window.location.origin + window.location.pathname;
-  const params = new URLSearchParams({
-    gh_owner: s.owner, gh_repo: s.repo, gh_branch: s.branch,
-    gh_filepath: s.filepath, gh_token: s.token
-  });
-  return `${base}?${params.toString()}`;
-}
+/* ---------- Auth screen ---------- */
 
-window.cbCopySetupLink = async function(){
-  const link = buildSetupLink();
-  if (!link){ showStatus('Connect first, then a setup link will be available.', 'err'); return; }
-  try {
-    await navigator.clipboard.writeText(link);
-    showStatus('Setup link copied — open it once on your other device to auto-connect.', 'ok');
-  } catch(e){
-    prompt('Copy this setup link:', link);
-  }
-};
-
-/* ---------- Load / Save ---------- */
-
-async function loadAll(){
-  tryConnectFromUrl();
-  const settings = getSettings();
-  if (!settings){
-    showConnectScreen();
-    return;
-  }
-  showAppScreen();
-  showStatus('Loading from GitHub…');
-  try {
-    const res = await ghGet(settings);
-    if (res.status === 200){
-      const data = await res.json();
-      currentSha = data.sha;
-      const decoded = b64DecodeUnicode(data.content.replace(/\n/g, ''));
-      auditions = JSON.parse(decoded || '[]');
-      auditions.sort((a,b) => new Date(a.date) - new Date(b.date));
-      showStatus('Synced with GitHub', 'ok');
-    } else if (res.status === 404){
-      // File doesn't exist yet — start empty, it'll be created on first save
-      auditions = [];
-      currentSha = null;
-      showStatus('Connected. No data file yet — add an audition to create it.', 'ok');
-    } else if (res.status === 401 || res.status === 403){
-      showStatus('GitHub authentication failed — check your token in Settings.', 'err');
-      auditions = [];
-    } else {
-      showStatus(`GitHub error (${res.status}) — check your Settings.`, 'err');
-      auditions = [];
-    }
-  } catch(e){
-    showStatus('Network error loading from GitHub: ' + e.message, 'err');
-  }
-  render();
-}
-
-async function persistToGithub(){
-  const settings = getSettings();
-  if (!settings) return false;
-  showStatus('Saving to GitHub…');
-  try {
-    const res = await ghPut(settings, auditions, currentSha);
-    if (res.ok){
-      const data = await res.json();
-      currentSha = data.content.sha;
-      showStatus('Saved ✓', 'ok');
-      setTimeout(() => showStatus(''), 2000);
-      return true;
-    } else {
-      const err = await res.json().catch(() => ({}));
-      showStatus(`Save failed: ${err.message || res.status}`, 'err');
-      return false;
-    }
-  } catch(e){
-    showStatus('Network error saving to GitHub: ' + e.message, 'err');
-    return false;
-  }
-}
-
-/* ---------- Connect / Settings screen ---------- */
-
-function showConnectScreen(){
+function renderAuthScreen(){
   document.getElementById('cb-app-screen').style.display = 'none';
-  const s = getSettings() || {};
-  document.getElementById('cb-connect-screen').innerHTML = `
+  document.getElementById('cb-header-actions').innerHTML = '';
+  const isSignup = authMode === 'signup';
+  document.getElementById('cb-auth-screen').innerHTML = `
     <div class="cb-connect">
-      <h2>Connect your GitHub repo</h2>
-      <p>Your auditions will be stored as a JSON file inside a repo you control. No third-party database needed.</p>
-      <ol>
-        <li>Go to <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">github.com/settings/personal-access-tokens/new</a></li>
-        <li>Resource owner: your account. Repository access: <b>Only select repositories</b> → pick this repo.</li>
-        <li>Permissions → Repository permissions → <b>Contents: Read and write</b></li>
-        <li>Generate, then copy the token (starts with <code>github_pat_</code>) and paste it below.</li>
-      </ol>
+      <h2>${isSignup ? 'Create your account' : 'Log in'}</h2>
+      <p>${isSignup ? 'Your own private call board — only you will see what you add.' : 'Welcome back to your call board.'}</p>
+      <div id="cb-auth-error"></div>
       <div class="cb-field">
-        <label>GitHub username / org</label>
-        <input id="s-owner" value="${s.owner || ''}" placeholder="e.g. jsmith">
+        <label>Email</label>
+        <input id="a-email" type="email" placeholder="you@example.com">
       </div>
       <div class="cb-field">
-        <label>Repository name</label>
-        <input id="s-repo" value="${s.repo || ''}" placeholder="e.g. audition-tracker">
+        <label>Password</label>
+        <input id="a-password" type="password" placeholder="${isSignup ? 'At least 6 characters' : ''}">
       </div>
-      <div class="cb-field">
-        <label>Branch</label>
-        <input id="s-branch" value="${s.branch || 'main'}">
-      </div>
-      <div class="cb-field">
-        <label>Data file path</label>
-        <input id="s-filepath" value="${s.filepath || 'data/auditions.json'}">
-      </div>
-      <div class="cb-field">
-        <label>Personal access token</label>
-        <input id="s-token" type="password" value="${s.token || ''}" placeholder="github_pat_...">
-      </div>
-      ${s.owner ? `<p style="margin-top:-4px;">Already connected here. To set up another device without retyping the token, copy a one-time link below and open it once on that device.</p>` : ''}
       <div class="cb-modal-actions">
-        ${s.owner ? `<button class="cb-btn-secondary" onclick="cbCopySetupLink()">Copy Setup Link</button>` : ''}
-        ${s.owner ? `<button class="cb-btn-danger" onclick="cbDisconnect()">Disconnect</button>` : ''}
-        <button class="cb-btn-primary" onclick="cbConnect()">${s.owner ? 'Save & Reconnect' : 'Connect'}</button>
+        <button class="cb-btn-primary" onclick="cbAuthSubmit()">${isSignup ? 'Sign Up' : 'Log In'}</button>
+      </div>
+      <div class="cb-auth-toggle">
+        ${isSignup
+          ? `Already have an account? <a onclick="cbSwitchAuthMode('login')">Log in</a>`
+          : `New here? <a onclick="cbSwitchAuthMode('signup')">Create an account</a>`}
       </div>
     </div>
   `;
 }
 
-function showAppScreen(){
-  document.getElementById('cb-connect-screen').innerHTML = '';
-  document.getElementById('cb-app-screen').style.display = '';
-}
+window.cbSwitchAuthMode = function(mode){
+  authMode = mode;
+  renderAuthScreen();
+};
 
-window.cbConnect = async function(){
-  const owner = document.getElementById('s-owner').value.trim();
-  const repo = document.getElementById('s-repo').value.trim();
-  const branch = document.getElementById('s-branch').value.trim() || 'main';
-  const filepath = document.getElementById('s-filepath').value.trim() || 'data/auditions.json';
-  const token = document.getElementById('s-token').value.trim();
-  if (!owner || !repo || !token){
-    showStatus('Please fill in username, repo, and token.', 'err');
+window.cbAuthSubmit = async function(){
+  const email = document.getElementById('a-email').value.trim();
+  const password = document.getElementById('a-password').value;
+  const errEl = document.getElementById('cb-auth-error');
+  errEl.innerHTML = '';
+  if (!email || !password){
+    errEl.innerHTML = `<div class="cb-auth-error">Please fill in both fields.</div>`;
     return;
   }
-  saveSettings({ owner, repo, branch, filepath, token });
-  await loadAll();
+  showStatus(authMode === 'signup' ? 'Creating account…' : 'Logging in…');
+  const fn = authMode === 'signup'
+    ? supabase.auth.signUp({ email, password })
+    : supabase.auth.signInWithPassword({ email, password });
+  const { data, error } = await fn;
+  if (error){
+    errEl.innerHTML = `<div class="cb-auth-error">${escapeHtml(error.message)}</div>`;
+    showStatus('');
+    return;
+  }
+  if (authMode === 'signup' && data.user && !data.session){
+    showStatus('');
+    errEl.innerHTML = `<div class="cb-auth-error" style="color: var(--booked);">Account created — check your email to confirm, then log in.</div>`;
+    authMode = 'login';
+    return;
+  }
+  showStatus('');
+  // onAuthStateChange will pick up the new session and load the app
 };
 
-window.cbOpenSettings = function(){
-  showConnectScreen();
+window.cbLogout = async function(){
+  await supabase.auth.signOut();
 };
 
-window.cbDisconnect = function(){
-  if (!confirm('Remove saved GitHub settings from this browser? Your data in GitHub is not deleted.')) return;
-  clearSettings();
-  auditions = [];
-  currentSha = null;
-  showConnectScreen();
-};
+/* ---------- Load / Save ---------- */
 
-/* ---------- Rendering ---------- */
+async function loadAll(){
+  showStatus('Loading your auditions…');
+  const { data, error } = await supabase
+    .from('auditions')
+    .select('*')
+    .order('date', { ascending: true });
+  if (error){
+    showStatus('Error loading data: ' + error.message, 'err');
+    auditions = [];
+  } else {
+    auditions = data.map(fromRow);
+    showStatus('');
+  }
+  render();
+}
+
+async function persistCreate(a){
+  const { data, error } = await supabase.from('auditions').insert(toRow(a)).select().single();
+  if (error){ showStatus('Save failed: ' + error.message, 'err'); return null; }
+  showStatus('Saved ✓', 'ok'); setTimeout(() => showStatus(''), 1500);
+  return fromRow(data);
+}
+async function persistUpdate(a){
+  const { error } = await supabase.from('auditions').update(toRow(a)).eq('id', a.id);
+  if (error){ showStatus('Save failed: ' + error.message, 'err'); return false; }
+  showStatus('Saved ✓', 'ok'); setTimeout(() => showStatus(''), 1500);
+  return true;
+}
+async function persistDelete(id){
+  const { error } = await supabase.from('auditions').delete().eq('id', id);
+  if (error){ showStatus('Delete failed: ' + error.message, 'err'); return false; }
+  return true;
+}
+
+/* ---------- Header / account state ---------- */
+
+function renderHeaderActions(){
+  document.getElementById('cb-header-actions').innerHTML = `
+    <span class="cb-account-label">${escapeHtml(currentUser.email)}</span>
+    <button class="cb-icon-btn" onclick="cbExportCsv()">Export CSV</button>
+    <button class="cb-icon-btn" onclick="cbLogout()">Log Out</button>
+    <button class="cb-add-btn" onclick="cbOpenModal()">+ New Audition</button>
+  `;
+}
+
+/* ---------- Rendering (views, cards, week groups) ---------- */
 
 function fmtDate(d){
   if(!d) return '';
@@ -283,6 +205,35 @@ function renderTabs(){
   statusTabs.querySelectorAll('button').forEach(b => b.onclick = () => { filterStatus = b.dataset.s; render(); });
 }
 
+function renderViewTabs(){
+  const el = document.getElementById('cb-view-tabs');
+  const views = [["board","Board"],["week","By Week"]];
+  el.innerHTML = views.map(([v,label]) =>
+    `<button class="cb-tab ${viewMode===v?'active':''}" data-v="${v}">${label}</button>`
+  ).join('');
+  el.querySelectorAll('button').forEach(b => b.onclick = () => { viewMode = b.dataset.v; render(); });
+}
+
+function renderSortSelect(){
+  const el = document.getElementById('cb-sort-select');
+  const options = [
+    ["date-asc", "Soonest first"],
+    ["date-desc", "Latest first"],
+    ["status", "By status"]
+  ];
+  el.innerHTML = options.map(([v,label]) => `<option value="${v}" ${sortBy===v?'selected':''}>${label}</option>`).join('');
+  el.onchange = () => { sortBy = el.value; render(); };
+  el.style.display = viewMode === 'board' ? '' : 'none';
+}
+
+function sortedList(list){
+  const copy = [...list];
+  if (sortBy === 'date-asc') copy.sort((a,b) => new Date(a.date) - new Date(b.date));
+  else if (sortBy === 'date-desc') copy.sort((a,b) => new Date(b.date) - new Date(a.date));
+  else if (sortBy === 'status') copy.sort((a,b) => (STATUS_ORDER[a.status] ?? 9) - (STATUS_ORDER[b.status] ?? 9) || new Date(a.date) - new Date(b.date));
+  return copy;
+}
+
 function renderStats(){
   const upcoming = auditions.filter(a => a.date && new Date(a.date) >= new Date(new Date().toDateString()) && a.status !== 'Passed').length;
   const callbacks = auditions.filter(a => a.status === 'Callback').length;
@@ -301,18 +252,81 @@ function statusClass(s){
 
 function escapeHtml(str){
   const d = document.createElement('div');
-  d.textContent = str;
+  d.textContent = str == null ? '' : str;
   return d.innerHTML;
 }
 
+function weekLabel(dateStr){
+  const d = new Date(dateStr + 'T00:00:00');
+  if (isNaN(d)) return { key: 'undated', label: 'No date set' };
+  const day = d.getDay();
+  const diffToMonday = (day === 0 ? -6 : 1) - day;
+  const monday = new Date(d); monday.setDate(d.getDate() + diffToMonday);
+  const sunday = new Date(monday); sunday.setDate(monday.getDate() + 6);
+  const fmt = (dt) => dt.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  const key = monday.toISOString().slice(0,10);
+  const label = `${fmt(monday)} – ${fmt(sunday)}, ${sunday.getFullYear()}`;
+  return { key, label };
+}
+
+function renderWeekView(list){
+  const container = document.getElementById('cb-week-view');
+  if (list.length === 0){
+    container.innerHTML = `<div class="cb-empty"><span class="cb-empty-title">Nothing pinned up</span>Add your first audition to start tracking.</div>`;
+    return;
+  }
+  const sorted = [...list].sort((a,b) => new Date(a.date) - new Date(b.date));
+  const groups = new Map();
+  sorted.forEach(a => {
+    const { key, label } = weekLabel(a.date);
+    if (!groups.has(key)) groups.set(key, { label, items: [] });
+    groups.get(key).items.push(a);
+  });
+  container.innerHTML = [...groups.values()].map(g => `
+    <div class="cb-week-group">
+      <div class="cb-week-header">${g.label}<span>${g.items.length} audition${g.items.length === 1 ? '' : 's'}</span></div>
+      <div class="cb-week-rows">
+        ${g.items.map(a => `
+          <div class="cb-week-row" onclick="cbEdit('${a.id}')">
+            <div class="cb-wr-date">${a.date ? new Date(a.date+'T00:00:00').toLocaleDateString(undefined,{weekday:'short', day:'numeric'}) : '—'}${a.time ? '<br>'+escapeHtml(a.time) : ''}</div>
+            <div class="cb-wr-main">
+              <div class="cb-wr-project">${escapeHtml(a.project || 'Untitled')}</div>
+              ${a.role ? `<div class="cb-wr-role">${escapeHtml(a.role)}</div>` : ''}
+            </div>
+            <div class="cb-wr-type">${escapeHtml(a.type || 'Other')}</div>
+            <div class="cb-stamp ${statusClass(a.status)}">${a.status || 'Submitted'}</div>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  `).join('');
+}
+
 function render(){
+  renderHeaderActions();
   renderTabs();
   renderStats();
-  const grid = document.getElementById('cb-grid');
+  renderViewTabs();
+  renderSortSelect();
+
   let list = auditions.filter(a =>
     (filterType === "All" || a.type === filterType) &&
     (filterStatus === "All" || a.status === filterStatus)
   );
+
+  const grid = document.getElementById('cb-grid');
+  const weekView = document.getElementById('cb-week-view');
+
+  if (viewMode === 'week'){
+    grid.style.display = 'none';
+    weekView.style.display = '';
+    renderWeekView(list);
+    return;
+  }
+  grid.style.display = '';
+  weekView.style.display = 'none';
+  list = sortedList(list);
+
   if (list.length === 0){
     grid.innerHTML = `<div class="cb-empty"><span class="cb-empty-title">Nothing pinned up</span>Add your first audition to start tracking.</div>`;
     return;
@@ -420,7 +434,7 @@ window.cbSave = async function(){
   const project = document.getElementById('f-project').value.trim();
   if (!project){ document.getElementById('f-project').focus(); return; }
   const a = {
-    id: editingId || (Date.now().toString(36) + Math.random().toString(36).slice(2,8)),
+    id: editingId,
     project,
     role: document.getElementById('f-role').value.trim(),
     date: document.getElementById('f-date').value,
@@ -429,15 +443,22 @@ window.cbSave = async function(){
     status: document.getElementById('f-status').value,
     format: document.getElementById('f-format').value.trim(),
     castingDirector: document.getElementById('f-cd').value.trim(),
-    notes: document.getElementById('f-notes').value.trim(),
-    createdAt: editingId ? (auditions.find(x=>x.id===editingId)||{}).createdAt || Date.now() : Date.now()
+    notes: document.getElementById('f-notes').value.trim()
   };
-  const idx = auditions.findIndex(x => x.id === a.id);
-  if (idx >= 0) auditions[idx] = a; else auditions.push(a);
-  auditions.sort((x,y) => new Date(x.date) - new Date(y.date));
-  render();
   cbCloseModal();
-  await persistToGithub();
+  if (editingId){
+    const idx = auditions.findIndex(x => x.id === editingId);
+    if (idx >= 0) auditions[idx] = { ...auditions[idx], ...a };
+    render();
+    await persistUpdate(a);
+  } else {
+    const created = await persistCreate(a);
+    if (created){
+      auditions.push(created);
+      auditions.sort((x,y) => new Date(x.date) - new Date(y.date));
+      render();
+    }
+  }
 };
 
 window.cbEdit = function(id){ cbOpenModal(id); };
@@ -445,7 +466,7 @@ window.cbEdit = function(id){ cbOpenModal(id); };
 window.cbDelete = async function(id){
   auditions = auditions.filter(x => x.id !== id);
   render();
-  await persistToGithub();
+  await persistDelete(id);
 };
 
 /* ---------- CSV export ---------- */
@@ -480,6 +501,23 @@ window.cbExportCsv = function(){
   URL.revokeObjectURL(url);
 };
 
-/* ---------- Init ---------- */
+/* ---------- Init & auth state wiring ---------- */
 
-loadAll();
+async function onSessionReady(session){
+  if (session && session.user){
+    currentUser = session.user;
+    document.getElementById('cb-auth-screen').innerHTML = '';
+    document.getElementById('cb-app-screen').style.display = '';
+    await loadAll();
+  } else {
+    currentUser = null;
+    document.getElementById('cb-app-screen').style.display = 'none';
+    renderAuthScreen();
+  }
+}
+
+supabase.auth.onAuthStateChange((_event, session) => {
+  onSessionReady(session);
+});
+
+supabase.auth.getSession().then(({ data }) => onSessionReady(data.session));
